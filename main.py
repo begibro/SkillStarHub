@@ -1,17 +1,9 @@
 import asyncio
 import logging
 import aiosqlite
+import os
 from datetime import datetime
-
-# Bot sozlamalari (config.py faylida bo'lishi kerak)
-try:
-    import config
-except ImportError:
-    class config:
-        BOT_TOKEN = "TOKEN_YAZING"
-        ADMIN_IDS = [12345678] # Admin IDlari
-        REFERRAL_REWARD = 500  # Har bir taklif uchun ball
-        VIP_PRICE = 5000       # VIP a'zolik narxi
+from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -20,9 +12,32 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
+# --- ENV YUKLASH ---
+load_dotenv()
+
+# --- CONFIGURATION (TIZIMDAN O'QISH) ---
+class config:
+    # Railway Variables bo'limidagi nomlar bilan bir xil bo'lishi shart
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    
+    # ADMIN_IDS ni vergul bilan yozilgan bo'lsa (masalan: 123,456) ro'yxatga aylantiradi
+    admin_raw = os.getenv("ADMIN_IDS", "12345678")
+    ADMIN_IDS = [int(x.strip()) for x in admin_raw.split(",") if x.strip().isdigit()]
+    
+    REFERRAL_REWARD = int(os.getenv("REFERRAL_REWARD", 500))
+    VIP_PRICE = int(os.getenv("VIP_PRICE", 5000))
+
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
 DB_PATH = "bot_database.db"
+
+# --- BOT VA DISPATCHER ---
+# Agar token bo'sh bo'lsa, xato beradi - bu Railway-da Variable o'rnatilmaganini bildiradi
+if not config.BOT_TOKEN:
+    raise ValueError("XATO: BOT_TOKEN topilmadi! Railway Variables bo'limiga qo'shing.")
+
+bot = Bot(token=config.BOT_TOKEN)
+dp = Dispatcher()
 
 # --- DATABASE ---
 async def init_db():
@@ -53,9 +68,6 @@ class AdminStates(StatesGroup):
     c_price = State()
     c_content = State()
 
-bot = Bot(token=config.BOT_TOKEN)
-dp = Dispatcher()
-
 # --- HELPERS ---
 async def check_sub(uid):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -74,7 +86,6 @@ def main_menu_kb(is_vip=False):
     kb.button(text="📚 Kurslar", callback_data="view_courses")
     kb.button(text="👤 Kabinet", callback_data="profile")
     kb.button(text="🔗 Takliflar", callback_data="referrals")
-    # BU YERDA O'ZGARDI:
     kb.button(text="🌟 VIP Sotib Olish" if not is_vip else "💎 VIP Status: Faol", callback_data="vip_pay")
     kb.adjust(1, 2, 1)
     return kb.as_markup()
@@ -109,7 +120,7 @@ async def start_cmd(message: types.Message, state: FSMContext):
             await db.execute("INSERT INTO users (user_id, join_date) VALUES (?, ?)", (uid, datetime.now().strftime("%Y-%m-%d")))
             if ref_id and ref_id != uid:
                 await db.execute("UPDATE users SET balance = balance + ?, referral_count = referral_count + 1 WHERE user_id = ?", (config.REFERRAL_REWARD, ref_id))
-                try: await bot.send_message(ref_id, "✅ Sizda yangi taklif bor! +{} ball".format(config.REFERRAL_REWARD))
+                try: await bot.send_message(ref_id, f"✅ Sizda yangi taklif bor! +{config.REFERRAL_REWARD} ball")
                 except: pass
             await db.commit()
             user = await (await db.execute("SELECT * FROM users WHERE user_id = ?", (uid,))).fetchone()
@@ -181,7 +192,7 @@ async def course_info(call: types.CallbackQuery):
         user = await (await db.execute("SELECT * FROM users WHERE user_id = ?", (call.from_user.id,))).fetchone()
         
         price = course['price']
-        if user['is_vip']: price = int(price * 0.5) # VIP chegirma
+        if user['is_vip']: price = int(price * 0.5)
 
         kb = InlineKeyboardBuilder()
         kb.button(text=f"💳 Sotib olish ({price} ball)", callback_data=f"buy_{cid}")
@@ -189,13 +200,10 @@ async def course_info(call: types.CallbackQuery):
         
         await call.message.edit_text(f"📖 Kurs: {course['title']}\n💰 Narxi: {price} ball\n\nSotib olmoqchimisiz?", reply_markup=kb.adjust(1).as_markup())
 
-# --- KURS SOTIB OLISH (Faqat raqam bo'lsa ishlaydi) ---
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy_course(call: types.CallbackQuery):
-    # Data format: buy_1, buy_2 ...
     data_parts = call.data.split("_")
-    if not data_parts[1].isdigit(): 
-        return # Agar raqam bo'lmasa, bu handler ishlamasin
+    if not data_parts[1].isdigit(): return
 
     cid = int(data_parts[1])
     uid = call.from_user.id
@@ -224,7 +232,6 @@ async def buy_course(call: types.CallbackQuery):
         else:
             await call.answer("❌ Ball yetarli emas!", show_alert=True)
 
-# --- VIP SOTIB OLISH HANDLERI (Nomi o'zgardi) ---
 @dp.callback_query(F.data == "vip_pay")
 async def buy_vip_process(call: types.CallbackQuery):
     uid = call.from_user.id
@@ -241,6 +248,7 @@ async def buy_vip_process(call: types.CallbackQuery):
             await call.message.edit_text(f"🌟 VIP Faollashtirildi!", reply_markup=main_menu_kb(True))
         else:
             await call.answer(f"❌ Ball yetarli emas! VIP narxi: {config.VIP_PRICE}", show_alert=True)
+
 # --- ADMIN PANEL ---
 @dp.message(Command("admin"), F.from_user.id.in_(config.ADMIN_IDS))
 async def admin_cmd(message: types.Message):
@@ -273,7 +281,6 @@ async def adm_bc_send(message: types.Message, state: FSMContext):
             except: pass
         await message.answer(f"✅ Xabar {count} ta foydalanuvchiga yuborildi.")
 
-# Foydalanuvchini ID orqali boshqarish
 @dp.callback_query(F.data == "adm_user_manage")
 async def adm_u_m(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.manage_user)
@@ -320,7 +327,6 @@ async def adm_vip_toggle(call: types.CallbackQuery, state: FSMContext):
         await call.answer("VIP status o'zgartirildi!")
         await state.clear()
 
-# Kurs qo'shish va o'chirish
 @dp.callback_query(F.data == "adm_add_course")
 async def adm_c_add(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.c_title)
@@ -367,7 +373,6 @@ async def adm_c_del_res(call: types.CallbackQuery):
     await call.answer("Kurs o'chirildi!")
     await adm_c_del_list(call)
 
-# Kanallar boshqaruvi
 @dp.callback_query(F.data == "adm_ch_list")
 async def adm_ch_manage(call: types.CallbackQuery, state: FSMContext):
     async with aiosqlite.connect(DB_PATH) as db:
